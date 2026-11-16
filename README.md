@@ -64,4 +64,5 @@ Windows 构建使用 `go build -o bps-local.exe ./cmd/bps-local`。附带的启�
 
 ## 社区
 
-[LINUX DO](https://linux.do/) · 项目发布与交流。
+- [LINUX DO](https://linux.do/) · 项目发布与交流。
+- QQ 交流群：`1135421637` · 项目使用与问题交流。
