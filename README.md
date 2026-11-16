@@ -1,5 +1,7 @@
 # bps-local
 
+**QQ 交流群：`1135421637`** · 项目使用与问题交流。
+
 将本机的 Responses API 请求转换为 ChatGPT Excel / Basispoints（BPS）请求的 Go 命令行桥接器。客户端通过 HTTP 发送请求、通过 SSE 接收事件；桥接器默认通过 WebSocket 连接 BPS 上游。
 
 ```text
@@ -65,4 +67,3 @@ Windows 构建使用 `go build -o bps-local.exe ./cmd/bps-local`。附带的启�
 ## 社区
 
 - [LINUX DO](https://linux.do/) · 项目发布与交流。
-- QQ 交流群：`1135421637` · 项目使用与问题交流。
