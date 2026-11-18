@@ -170,9 +170,13 @@ func (c *DeviceClient) Login(ctx context.Context, show func(DevicePrompt) error)
 	if base64.RawURLEncoding.EncodeToString(digest[:]) != grant.Challenge {
 		return nil, errors.New("device authorization PKCE mismatch")
 	}
-	form := url.Values{"grant_type": {"authorization_code"}, "code": {grant.Code}, "client_id": {ExcelClientID}, "redirect_uri": {deviceRedirect}, "code_verifier": {grant.Verifier}}
+	return c.exchange(ctx, grant.Code, grant.Verifier, deviceRedirect)
+}
+
+func (c *DeviceClient) exchange(ctx context.Context, authorizationCode, verifier, redirect string) (*DeviceCredentials, error) {
+	form := url.Values{"grant_type": {"authorization_code"}, "code": {authorizationCode}, "client_id": {ExcelClientID}, "redirect_uri": {redirect}, "code_verifier": {verifier}}
 	var creds DeviceCredentials
-	status, code, e = c.post(ctx, "/oauth/token?unified=true", "application/x-www-form-urlencoded", strings.NewReader(form.Encode()), &creds)
+	status, code, e := c.post(ctx, "/oauth/token?unified=true", "application/x-www-form-urlencoded", strings.NewReader(form.Encode()), &creds)
 	if e != nil {
 		return nil, e
 	}

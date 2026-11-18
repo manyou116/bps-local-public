@@ -18,19 +18,33 @@ Responses 客户端 → http://127.0.0.1:8790/v1/responses → BPS WebSocket
 go build -o bps-local ./cmd/bps-local
 ```
 
-以下示例使用本机 `7890` 代理端口，请替换成自己的代理地址。先完成独立 BPS 授权：
+以下示例使用本机 `7890` 代理端口，请替换成自己的代理地址。先完成独立 BPS 授权，默认使用设备码登录：
 
 ```bash
 ./bps-local --login --proxy http://127.0.0.1:7890
 ```
 
-浏览器打开后，由你完成登录与授权。默认保存到 `~/.bps-local/oauth.json`；若文件已存在，程序拒绝覆盖，可用 `--auth` 指定另一个文件。程序不会自动读取或修改 Codex 的授权文件。
+终端显示设备码并打开授权页面，由你完成登录与确认。默认保存到 `~/.bps-local/oauth.json`；若文件已存在，程序拒绝覆盖，可用 `--auth` 指定另一个文件。程序不会自动读取或修改 Codex 的授权文件。
+
+也可以使用普通浏览器授权，无需输入设备码。需要已安装 Chrome、Chromium 或 Edge：
+
+```bash
+./bps-local --login --login-method browser \
+  --auth "$HOME/.bps-local/browser-oauth.json" \
+  --proxy http://127.0.0.1:7890
+```
+
+程序打开独立的临时浏览器窗口，由你完成登录、验证码和授权；成功后自动保存凭据。它不读取已有 Chrome、Excel 或 Codex 的登录信息，结束时关闭本次窗口并清理临时 profile。无法自动找到浏览器时，用 `--browser-path` 指定其可执行文件路径。浏览器模式仅支持无用户名密码的代理；带认证的上游代理需先通过本地转发使用。
+
+无桌面的 Linux 使用设备码模式加 `--no-browser`，在其他电脑打开终端输出的网址完成授权。`--login-method browser` 不支持 `--no-browser`。详细步骤见 [独立授权](docs/USAGE.md#2-独立授权)。
 
 启动桥接器，保持该终端运行：
 
 ```bash
 ./bps-local --proxy http://127.0.0.1:7890
 ```
+
+若登录时指定了另一个 OAuth 文件，启动时也需指定同一个 `--auth` 路径。
 
 在另一终端调用本地接口。将 `YOUR_MODEL` 换成该账号实际有权使用的模型：
 

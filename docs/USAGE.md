@@ -22,13 +22,50 @@ go build -o bps-local.exe ./cmd/bps-local
 
 ## 2. 独立授权
 
-通过自己的 BPS 设备授权流程获取凭据：
+支持设备码和普通浏览器两种独立授权方式。`--login` 默认保持设备码模式；`--login-method` 只能与 `--login` 一起使用。
+
+### 设备码登录
 
 ```bash
 ./bps-local --login --proxy http://127.0.0.1:7890
 ```
 
-终端输出登录地址和设备码，并尝试打开浏览器。由你在浏览器完成授权，程序最多等待 15 分钟。没有可用浏览器时，用 `--no-browser` 只打印地址，然后手动打开。
+终端输出登录地址和设备码，并尝试打开浏览器。由你在浏览器完成授权，程序最多等待 15 分钟。也可显式添加 `--login-method device`。
+
+无桌面 Linux 或需要在另一台电脑完成授权时：
+
+```bash
+./bps-local --login --no-browser --proxy http://127.0.0.1:7890
+```
+
+在自己的电脑打开终端输出的网址并输入设备码，保持服务器上的命令运行，等待凭据保存完成。
+
+### 普通浏览器授权
+
+本机需要已安装 Chrome、Chromium 或 Edge，并具有可显示浏览器窗口的桌面环境：
+
+```bash
+./bps-local --login --login-method browser \
+  --auth "$HOME/.bps-local/browser-oauth.json" \
+  --proxy http://127.0.0.1:7890
+```
+
+程序使用独立临时 profile 打开授权页面，由你输入账号、密码或验证码，选择工作区并确认授权。它通过 PKCE 完成独立授权，自动捕获本次授权回调并保存凭据，不需要设备码，也不需要安装或打开 Excel。当前仅支持授权站点内的登录流程；Google、Microsoft 等需要跳转到外部站点的第三方 SSO 请使用设备码方式。
+
+浏览器不会读取已有 Chrome、Excel 或 Codex 的登录信息。结束时只关闭本次启动的浏览器并删除临时 profile；原有浏览器窗口和授权文件不受影响。此模式使用 BPS 注册的 HTTPS 回调，并非监听本机 OAuth 回调端口。不要把它与 `--no-browser` 一起使用。
+
+若自动发现浏览器失败，添加 `--browser-path`，例如：
+
+```bash
+./bps-local --login --login-method browser \
+  --browser-path /usr/bin/chromium \
+  --auth "$HOME/.bps-local/browser-oauth.json" \
+  --proxy http://127.0.0.1:7890
+```
+
+`--browser-path` 应指向本机实际安装的浏览器可执行文件。通过 `--proxy` 或 `BPS_LOCAL_PROXY` 指定代理后，浏览器和 Token 交换使用该代理；两者均未配置时，浏览器授权全流程直连，不自动推断系统代理。浏览器模式仅接受不含用户名密码的 HTTP、HTTPS 或 SOCKS 代理 URL。需要使用带认证的上游代理时，先配置本机代理转发，再把本机无认证地址传给 CLI。
+
+### 凭据保存与检查
 
 OAuth 文件路径的优先级为：`--auth` 参数、`BPS_AUTH_FILE` 环境变量、`~/.bps-local/oauth.json`。例如，为另一个账号使用独立文件：
 
@@ -66,7 +103,7 @@ OAuth 文件路径的优先级为：`--auth` 参数、`BPS_AUTH_FILE` 环境变�
 BPS_LOCAL_PROXY=http://127.0.0.1:7890 ./bps-local
 ```
 
-`--proxy` 优先于环境变量，支持 `http`、`https`、`socks5`、`socks5h` 地址。登录和运行服务是两个独立命令，需要分别配置代理；代理地址不会因为一次登录而自动成为后续启动的配置。需要固定代理出口时，请在这两个命令中都显式指定。
+`--proxy` 优先于环境变量，支持 `http`、`https`、`socks5`、`socks5h` 地址。浏览器授权模式另要求代理 URL 不含用户名密码。登录和运行服务是两个独立命令，需要分别配置代理；代理地址不会因为一次登录而自动成为后续启动的配置。需要固定代理出口时，请在这两个命令中都显式指定。
 
 使用指定授权文件和端口：
 
@@ -154,8 +191,10 @@ curl -N http://127.0.0.1:8790/v1/responses \
 
 | 参数 | 默认值 / 用途 |
 |---|---|
-| `--login` | 执行设备授权并保存到一个尚不存在的 OAuth 文件 |
-| `--no-browser` | 登录时只打印 URL，不自动打开浏览器 |
+| `--login` | 执行独立授权并保存到一个尚不存在的 OAuth 文件，默认使用设备码 |
+| `--login-method` | `device`；可选 `browser`，仅与 `--login` 一起使用 |
+| `--browser-path` | 浏览器授权使用的 Chrome、Chromium 或 Edge 可执行文件路径；省略时自动发现 |
+| `--no-browser` | 设备码登录只打印 URL 和设备码，不自动打开浏览器；不支持 browser 模式 |
 | `--auth` | OAuth 文件；未指定时读取 `BPS_AUTH_FILE` 或 `~/.bps-local/oauth.json` |
 | `--auth-path` | 输出选中的 OAuth 路径后退出，不读取凭据 |
 | `--check` | 检查本地凭据信息，不验证上游生成 |
@@ -186,6 +225,8 @@ curl -N http://127.0.0.1:8790/v1/responses \
 |---|---|
 | `bind: address already in use` | 原有进程已占用端口；使用另一个 `--addr` 或先停止已确认的旧进程 |
 | `OAuth destination exists` | 使用新的 `--auth` 路径，登录不会覆盖旧文件 |
+| 浏览器授权无法启动 | 确认已安装 Chrome、Chromium 或 Edge，并使用桌面环境；可用 `--browser-path` 指定可执行文件。无桌面服务器使用设备码模式加 `--no-browser` |
+| 浏览器授权拒绝代理配置 | 代理 URL 不应含用户名密码；带认证的上游代理需先配置本机转发，再使用本机无认证代理地址 |
 | 状态目录已被占用 | 停止持有该目录的旧服务，或为另一个实例指定独立 `--state-dir`；仅修改端口不够，不要删除正在使用的 `owner.lock` |
 | task key 缺失、无效或权限错误 | 恢复该状态目录原有的 `task.key` 并检查权限；不要用新 key 覆盖旧身份 |
 | `bps_queue_full` / `bps_queue_timeout` | 本地槽位等待队列已满或等待预算耗尽；减少并发调用，检查请求是否长时间占用槽位 |

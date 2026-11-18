@@ -2,7 +2,7 @@
 // the ChatGPT Excel (Basispoints) gateway using your own ChatGPT login.
 //
 // It reads an independent BPS OAuth file and writes new credentials only during
-// explicit device login. The bridge listens only on loopback and sends prompts
+// explicit login. The bridge listens only on loopback and sends prompts
 // only to bps.openai.com.
 package main
 
@@ -25,15 +25,17 @@ import (
 	"github.com/sunboyzoey/GPT-BPS/internal/proxy"
 )
 
-var version = "0.2.0"
+var version = "0.3.0"
 
 func main() {
 	log.SetFlags(0)
 	log.SetPrefix("[bps-local] ")
 
 	var (
-		login         = flag.Bool("login", false, "perform BPS device login and save a new independent OAuth file")
-		noBrowser     = flag.Bool("no-browser", false, "print login URL without opening a browser")
+		login         = flag.Bool("login", false, "perform BPS login and save a new independent OAuth file")
+		loginMethod   = flag.String("login-method", "", "login method: device (default) or browser; requires --login")
+		browserPath   = flag.String("browser-path", "", "Chrome, Chromium, or Edge executable for --login --login-method browser")
+		noBrowser     = flag.Bool("no-browser", false, "device login only: print login URL without opening a browser")
 		addr          = flag.String("addr", "127.0.0.1:8790", "loopback address to listen on")
 		authPath      = flag.String("auth", "", "BPS OAuth file (default: $BPS_AUTH_FILE or ~/.bps-local/oauth.json)")
 		showAuthPath  = flag.Bool("auth-path", false, "print selected OAuth file path without reading credentials")
@@ -54,6 +56,9 @@ func main() {
 	)
 	diagnostic := registerProtocolDiagnosticFlags(flag.CommandLine)
 	flag.Parse()
+	if err := validateLoginFlags(*login, *loginMethod, *browserPath, *noBrowser); err != nil {
+		log.Fatal(err)
+	}
 	if *transport != "ws" {
 		log.Fatal("official BPS requires --upstream-transport ws; legacy POST/SSE is unsupported (local API stays HTTP/SSE)")
 	}
@@ -77,34 +82,14 @@ func main() {
 	}
 
 	if *login {
-		path := authPathOrDefault(*authPath)
-		if _, err := os.Lstat(path); err == nil {
-			log.Fatal("OAuth destination exists; choose a new --auth path (no credentials overwritten)")
-		} else if !os.IsNotExist(err) {
-			log.Fatal(err)
-		}
-		client, err := auth.NewDeviceClient(*proxyURL)
-		if err != nil {
-			log.Fatal(err)
-		}
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
-		creds, err := client.Login(ctx, func(p auth.DevicePrompt) error {
-			fmt.Printf("Open: %s\nDevice code: %s\nComplete authorization yourself in the browser. Waiting up to 15 minutes…\n", p.URL, p.UserCode)
-			if !*noBrowser {
-				if err := openBrowser(p.URL); err != nil {
-					log.Print("Browser could not be opened; open the URL above manually.")
-				}
-			}
-			return nil
-		})
-		if err != nil {
+		if err := runLogin(ctx, loginOptions{
+			Method: *loginMethod, BrowserPath: *browserPath, NoBrowser: *noBrowser,
+			AuthPath: authPathOrDefault(*authPath), ProxyURL: *proxyURL,
+		}, os.Stdout); err != nil {
 			log.Fatal(err)
 		}
-		if err = auth.SaveDeviceCredentials(path, creds); err != nil {
-			log.Fatal(err)
-		}
-		fmt.Printf("BPS OAuth credentials saved: %s\nBPS generation not yet verified. Automatic refresh remains disabled.\n", path)
 		return
 	}
 
@@ -113,7 +98,7 @@ func main() {
 		if diagnostic.Enabled {
 			log.Fatal("protocol diagnostic could not load the independent BPS OAuth file; no diagnostic requests were sent")
 		}
-		log.Fatalf("credentials: %v\n\nProvide independent BPS OAuth credentials with --auth or BPS_AUTH_FILE. Codex credentials are not loaded automatically; run --login for device authorization; automatic refresh is not configured.", err)
+		log.Fatalf("credentials: %v\n\nProvide independent BPS OAuth credentials with --auth or BPS_AUTH_FILE. Codex credentials are not loaded automatically; run --login (device) or --login --login-method browser; automatic refresh is not configured.", err)
 	}
 
 	if diagnostic.Enabled {
