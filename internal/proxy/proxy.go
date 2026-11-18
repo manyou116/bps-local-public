@@ -32,7 +32,8 @@ type Config struct {
 	Addr string
 	// Upstream is the Basispoints Responses endpoint.
 	Upstream string
-	// UpstreamTransport is "ws" (default) or the legacy "sse" transport.
+	// UpstreamTransport is "ws" for official BPS. Legacy "sse" is retained
+	// only for explicitly configured alternative upstreams and offline fixtures.
 	UpstreamTransport string
 	// WSIdleTimeout bounds a wait for the next upstream data/control message.
 	WSIdleTimeout time.Duration
@@ -44,6 +45,10 @@ type Config struct {
 	ProxyURL string
 	// Verbose logs each request line, never prompt content or tokens.
 	Verbose bool
+	// Zero RPS disables pacing. Queue/wait zero values select 64 and 30 seconds.
+	UpstreamRPS     int
+	RateQueueLimit  int
+	RateWaitTimeout time.Duration
 }
 
 // CredentialSource supplies an isolated credential snapshot.
@@ -54,15 +59,27 @@ type CredentialSource interface {
 
 // Server is the local bridge.
 type Server struct {
-	cfg    Config
-	store  CredentialSource
-	client *http.Client
-	replay *basispoints.ReplayCache
+	cfg                Config
+	store              CredentialSource
+	client             *http.Client
+	replay             *basispoints.ReplayCache
+	startRates         *startRates
+	dialRates          *startRates
+	startAuthorization startAuthorization
+	startDeadline      time.Time
 }
 
 // New builds a server. It fails early when credentials are unusable so the user
 // does not discover the problem mid-request.
 func New(cfg Config, store CredentialSource) (*Server, error) {
+	rates, err := newStartRates(cfg)
+	if err != nil {
+		return nil, err
+	}
+	dialRates, err := newStartRates(cfg)
+	if err != nil {
+		return nil, err
+	}
 	if cfg.Upstream == "" {
 		cfg.Upstream = basispoints.ResponsesURL
 	}
@@ -75,6 +92,9 @@ func New(cfg Config, store CredentialSource) (*Server, error) {
 	u, err := url.Parse(cfg.Upstream)
 	if err != nil || u.Host == "" || u.User != nil || u.Fragment != "" {
 		return nil, fmt.Errorf("invalid upstream URL")
+	}
+	if cfg.UpstreamTransport == "sse" && strings.EqualFold(strings.TrimSuffix(u.Hostname(), "."), "bps.openai.com") {
+		return nil, fmt.Errorf("official BPS requires upstream transport ws; legacy POST/SSE is unsupported (the local Responses API still uses HTTP/SSE)")
 	}
 	switch u.Scheme {
 	case "https", "wss":
@@ -113,9 +133,11 @@ func New(cfg Config, store CredentialSource) (*Server, error) {
 	}
 
 	return &Server{
-		cfg:    cfg,
-		store:  store,
-		replay: &basispoints.ReplayCache{},
+		cfg:        cfg,
+		store:      store,
+		replay:     &basispoints.ReplayCache{},
+		startRates: rates,
+		dialRates:  dialRates,
 		client: &http.Client{
 			Transport: transport,
 			// Never follow a redirect with a bearer subprotocol or account headers.
@@ -178,6 +200,19 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		log.Printf("stripped server tools: %v", removed.RemovedServerTools)
 	}
 
+	options := basispoints.PrepareOptions{SessionID: logicalSessionFor(r)}
+	upstreamIdentity, hasUpstreamIdentity := upstreamTaskFor(r)
+	if hasUpstreamIdentity {
+		if upstreamIdentity.taskID == "" && upstreamIdentity.turnID == "" {
+			s.fail(w, http.StatusBadRequest, "basispoints_request_invalid", "invalid server-owned upstream task identity")
+			return
+		}
+		options.UpstreamTaskID, options.UpstreamTurnID = upstreamIdentity.taskID, upstreamIdentity.turnID
+	}
+	if err := options.Validate(); err != nil {
+		s.fail(w, http.StatusBadRequest, "basispoints_request_invalid", err.Error())
+		return
+	}
 	scope := s.scopeFor(r)
 	if s.cfg.ImageRelay != nil {
 		raw, err = s.cfg.ImageRelay.Rewrite(raw, scope)
@@ -190,10 +225,13 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	upstreamBody, bridge, err := basispoints.Prepare(raw, scope, s.replay)
+	upstreamBody, bridge, err := basispoints.PrepareWithOptions(raw, scope, s.replay, options)
 	if err != nil {
 		s.fail(w, http.StatusBadRequest, "basispoints_request_invalid", err.Error())
 		return
+	}
+	if hasUpstreamIdentity {
+		writeUpstreamTaskHashes(w.Header(), upstreamBody)
 	}
 
 	token, accountID, err := s.store.Credentials()
@@ -210,10 +248,15 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx := r.Context()
+	rateWait := &startRateWaitObservation{}
+	ctx := context.WithValue(r.Context(), startRateWaitKey{}, rateWait)
+	wsTiming := &webSocketTiming{}
+	ctx = context.WithValue(ctx, webSocketTimingKey{}, wsTiming)
 	w.Header().Set("X-BPS-Prepare-Ms", strconv.FormatInt(time.Since(start).Milliseconds(), 10))
 	openStarted := time.Now()
 	upstream, err := s.openUpstream(ctx, upstreamBody, token, accountID)
+	wsTiming.writeHeaders(w.Header())
+	w.Header().Set("X-BPS-Rate-Wait-Ms", strconv.FormatInt(rateWait.elapsed.Milliseconds(), 10))
 	w.Header().Set("X-BPS-Upstream-Open-Ms", strconv.FormatInt(time.Since(openStarted).Milliseconds(), 10))
 	if err != nil {
 		if ctx.Err() != nil {
@@ -221,6 +264,13 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		}
 		status := http.StatusBadGateway
 		code := "basispoints_transport_error"
+		var pacing *StartRateError
+		if errors.As(err, &pacing) {
+			status, code = pacing.Status, pacing.Code
+			if status == http.StatusTooManyRequests {
+				w.Header().Set("Retry-After", "1")
+			}
+		}
 		var rejected *upstreamRejection
 		if errors.As(err, &rejected) {
 			code = "basispoints_upstream_error"
@@ -373,6 +423,15 @@ func jsonString(v string) string {
 
 // ListenAndServe runs the bridge until ctx is cancelled.
 func (s *Server) ListenAndServe(ctx context.Context) error {
+	return s.ListenAndServeHandler(ctx, s.Handler())
+}
+
+// ListenAndServeHandler preserves the loopback and lifecycle restrictions while
+// allowing an admission wrapper around the ordinary Responses handler.
+func (s *Server) ListenAndServeHandler(ctx context.Context, handler http.Handler) error {
+	if handler == nil {
+		return errors.New("bridge handler is required")
+	}
 	addr := s.cfg.Addr
 	if addr == "" {
 		addr = "127.0.0.1:8790"
@@ -387,21 +446,39 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	srv := &http.Server{
-		Handler: s.Handler(), ReadHeaderTimeout: 30 * time.Second,
-		BaseContext: func(net.Listener) context.Context { return ctx },
+		Handler: handler, ReadHeaderTimeout: 30 * time.Second,
+		BaseContext: func(net.Listener) context.Context { return runCtx },
 	}
+	shutdownDone := make(chan struct{})
 	go func() {
-		<-ctx.Done()
+		defer close(shutdownDone)
+		<-runCtx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		_ = srv.Shutdown(shutdownCtx)
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			_ = srv.Close()
+		}
 	}()
 	log.Printf("bridge listening on http://%s", ln.Addr())
-	if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+	err = srv.Serve(ln)
+	cancel()
+	<-shutdownDone
+	if err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}
 	return nil
+}
+
+// WithIsolatedReplay gives a request its own tool-identity cache. Standalone
+// callers have no authenticated conversation namespace, so they must supply
+// full tool history instead of borrowing a prior caller's cached tool call.
+func (s *Server) WithIsolatedReplay() *Server {
+	copy := *s
+	copy.replay = &basispoints.ReplayCache{}
+	return &copy
 }
 
 // WithCredentials shares transport and replay cache, never mutable credentials.
@@ -420,6 +497,8 @@ func (s *Server) WithProxyURL(address string) (*Server, func(), error) {
 		return nil, nil, err
 	}
 	next.replay = s.replay
+	next.startRates, next.dialRates = s.startRates, s.dialRates
+	next.startAuthorization, next.startDeadline = s.startAuthorization, s.startDeadline
 	return next, next.client.CloseIdleConnections, nil
 }
 

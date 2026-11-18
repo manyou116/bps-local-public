@@ -21,31 +21,42 @@ import (
 
 	"github.com/sunboyzoey/GPT-BPS/internal/auth"
 	"github.com/sunboyzoey/GPT-BPS/internal/basispoints"
+	"github.com/sunboyzoey/GPT-BPS/internal/gateway"
 	"github.com/sunboyzoey/GPT-BPS/internal/proxy"
 )
 
-var version = "0.1.0-ws-dev"
+var version = "0.2.0"
 
 func main() {
 	log.SetFlags(0)
 	log.SetPrefix("[bps-local] ")
 
 	var (
-		login        = flag.Bool("login", false, "perform BPS device login and save a new independent OAuth file")
-		noBrowser    = flag.Bool("no-browser", false, "print login URL without opening a browser")
-		addr         = flag.String("addr", "127.0.0.1:8790", "loopback address to listen on")
-		authPath     = flag.String("auth", "", "BPS OAuth file (default: $BPS_AUTH_FILE or ~/.bps-local/oauth.json)")
-		showAuthPath = flag.Bool("auth-path", false, "print selected OAuth file path without reading credentials")
-		proxyURL     = flag.String("proxy", os.Getenv("BPS_LOCAL_PROXY"), "outbound proxy URL, e.g. http://127.0.0.1:7890")
-		transport    = flag.String("upstream-transport", "ws", "upstream transport: ws or sse (local API stays HTTP/SSE)")
-		wsIdle       = flag.Duration("ws-idle-timeout", 2*time.Minute, "maximum wait for the next upstream WebSocket event")
-		toolsVersion = flag.String("bps-tools-version", "", "optional BPS tool version ID; empty uses the server default")
-		arcText      = flag.Bool("arc-text-session", false, "experimental ARC initialization with no Excel tools; text-only requests")
-		showVersion  = flag.Bool("version", false, "print version and exit")
-		check        = flag.Bool("check", false, "inspect local credential metadata (does not verify BPS access)")
+		login         = flag.Bool("login", false, "perform BPS device login and save a new independent OAuth file")
+		noBrowser     = flag.Bool("no-browser", false, "print login URL without opening a browser")
+		addr          = flag.String("addr", "127.0.0.1:8790", "loopback address to listen on")
+		authPath      = flag.String("auth", "", "BPS OAuth file (default: $BPS_AUTH_FILE or ~/.bps-local/oauth.json)")
+		showAuthPath  = flag.Bool("auth-path", false, "print selected OAuth file path without reading credentials")
+		proxyURL      = flag.String("proxy", os.Getenv("BPS_LOCAL_PROXY"), "outbound proxy URL, e.g. http://127.0.0.1:7890")
+		transport     = flag.String("upstream-transport", "ws", "official BPS upstream transport: ws only (local API stays HTTP/SSE)")
+		wsIdle        = flag.Duration("ws-idle-timeout", 2*time.Minute, "maximum wait for the next upstream WebSocket event")
+		maxConcurrent = flag.Int("max-concurrent", gateway.DefaultLimits().PerAccount, "maximum active requests and fixed task slots per account (1-10000)")
+		maxPending    = flag.Int("max-pending", 64, "maximum requests waiting for a task slot; 0 disables queuing")
+		queueWait     = flag.Duration("queue-timeout", 30*time.Second, "total admission and upstream-start wait budget (does not limit generation time)")
+		stateDir      = flag.String("state-dir", os.Getenv("BPS_LOCAL_STATE_DIR"), "private task state directory (default ~/.bps-local/local-state); preserve across restarts")
+		upstreamRPS   = flag.Int("upstream-rps", 0, "per-account response.create starts in any rolling second; 0 disables (maximum 10000)")
+		rateWait      = flag.Duration("rate-wait-timeout", 30*time.Second, "maximum wait for an upstream start slot")
+		ratePending   = flag.Int("rate-max-pending", 64, "maximum pending upstream starts per account; 0 uses the default 64")
+		toolsVersion  = flag.String("bps-tools-version", "", "optional BPS tool version ID; empty uses the server default")
+		arcText       = flag.Bool("arc-text-session", false, "experimental ARC initialization with no Excel tools; text-only requests")
+		showVersion   = flag.Bool("version", false, "print version and exit")
+		check         = flag.Bool("check", false, "inspect local credential metadata (does not verify BPS access)")
 	)
 	diagnostic := registerProtocolDiagnosticFlags(flag.CommandLine)
 	flag.Parse()
+	if *transport != "ws" {
+		log.Fatal("official BPS requires --upstream-transport ws; legacy POST/SSE is unsupported (local API stays HTTP/SSE)")
+	}
 
 	if diagnostic.Enabled {
 		if err := validateProtocolDiagnosticFlags(diagnostic, protocolDiagnosticConflicts{
@@ -113,6 +124,9 @@ func main() {
 			ProxyURL:          *proxyURL,
 			UpstreamTransport: *transport,
 			WSIdleTimeout:     *wsIdle,
+			UpstreamRPS:       *upstreamRPS,
+			RateWaitTimeout:   *rateWait,
+			RateQueueLimit:    *ratePending,
 			ToolsVersion:      *toolsVersion,
 		}, store, diagnostic); err != nil {
 			log.Fatal(err)
@@ -167,19 +181,23 @@ func main() {
 		ProxyURL:          *proxyURL,
 		UpstreamTransport: *transport,
 		WSIdleTimeout:     *wsIdle,
+		UpstreamRPS:       *upstreamRPS,
+		RateWaitTimeout:   *rateWait,
+		RateQueueLimit:    *ratePending,
 		ToolsVersion:      *toolsVersion,
 		Verbose:           true,
 	}, store)
 	if err != nil {
 		log.Fatalf("%v", err)
 	}
-
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	log.Printf("using ChatGPT account %s", maskID(accountID))
 	log.Printf("upstream transport: %s; local Responses endpoint: HTTP/SSE", *transport)
-	if err := srv.ListenAndServe(ctx); err != nil {
+	if err := serveStandalone(ctx, srv, store, *stateDir, gateway.Limits{
+		PerAccount: *maxConcurrent, Queue: *maxPending, Wait: *queueWait,
+	}, *upstreamRPS); err != nil {
 		log.Fatalf("%v", err)
 	}
 }

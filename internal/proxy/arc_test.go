@@ -25,7 +25,11 @@ func TestARCLifecycle(t *testing.T) {
 			mux.HandleFunc("/basispoints/api/", func(w http.ResponseWriter, r *http.Request) {
 				path := strings.TrimPrefix(r.URL.Path, "/basispoints/api/")
 				mark(path)
-				if r.Header.Get("Authorization") != "Bearer test-token" {
+				if path == "responses" {
+					if r.Header.Get("Authorization") != "" || !strings.Contains(r.Header.Get("Sec-WebSocket-Protocol"), "openai-bearer.test-token") {
+						t.Error("missing WS subprotocol credential or duplicate REST credential")
+					}
+				} else if r.Header.Get("Authorization") != "Bearer test-token" {
 					t.Error("missing expected API credential")
 				}
 				w.Header().Set("Content-Type", "application/json")

@@ -1,6 +1,6 @@
 # bps-local 使用说明
 
-本文对应 **2026-11-06 的 `8736c9f` 源码快照**。这里只介绍独立 `cmd/bps-local`，不涉及 CPA 插件、管理界面或其他服务。上游使用产品内部的 BPS 接口，本文说明源码行为，不保证当前账号或接口可用。
+本文介绍独立 `cmd/bps-local`，不涉及 CPA 插件、管理界面或其他服务。上游使用产品内部的 BPS 接口，本文说明源码行为，不保证当前账号或接口可用。
 
 ## 1. 构建
 
@@ -18,7 +18,7 @@ go build -o bps-local.exe ./cmd/bps-local
 .\bps-local.exe --help
 ```
 
-下载依赖可能需要网络。源码保留快照原有的 Go module 路径，本地构建不要求目录名称与 module 路径一致。
+下载依赖可能需要网络。本地构建不要求目录名称与 Go module 路径一致。
 
 ## 2. 独立授权
 
@@ -72,10 +72,11 @@ BPS_LOCAL_PROXY=http://127.0.0.1:7890 ./bps-local
 
 ```bash
 ./bps-local --auth "$HOME/.bps-local/account-2.json" \
-  --addr 127.0.0.1:8791 --proxy http://127.0.0.1:7890
+  --addr 127.0.0.1:8791 --state-dir "$HOME/.bps-local/account-2-state" \
+  --proxy http://127.0.0.1:7890
 ```
 
-服务只允许绑定回环地址，不接受 `0.0.0.0`。本地端点没有 API Key 校验，应在可信的本机环境使用。按 `Ctrl+C` 停止服务。
+服务只允许绑定回环地址，不接受 `0.0.0.0`。本地端点没有 API Key 校验，应在可信的本机环境使用。按 `Ctrl+C` 停止服务。多个实例必须使用不同的监听地址和独立状态目录，详见第 5 节。
 
 Windows 附带脚本 `bps.ps1` 的默认代理为 `http://127.0.0.1:12450`。如果代理实际监听 `7890`，应这样启动：
 
@@ -88,7 +89,7 @@ Windows 附带脚本 `bps.ps1` 的默认代理为 `http://127.0.0.1:12450`。如
 
 ## 4. 请求与会话
 
-本地支持 `POST /v1/responses`，兼容路径为 `POST /responses`。成功建立流后返回 `text/event-stream`。此 CLI 不提供 `/v1/chat/completions`、`/v1/models` 或非流式 JSON 聚合响应。
+本地支持 `POST /v1/responses`，兼容路径为 `POST /responses`。成功建立流后返回 `text/event-stream`，即使请求包含 `stream:false` 也仍返回 SSE。此 CLI 不提供 `/v1/chat/completions`、`/v1/models` 或非流式 JSON 聚合响应。
 
 将以下 `YOUR_MODEL` 替换为账号有权使用的模型：
 
@@ -103,7 +104,7 @@ curl -N http://127.0.0.1:8790/v1/responses \
   }'
 ```
 
-默认链路为：本地 HTTP 请求 → 转换为 BPS 请求 → 独立的上游 WebSocket → 转换为 Responses SSE 事件。每次本地请求建立自己的上游 WebSocket；连接异常不会自动重连并重发生成。
+链路为：本地 HTTP 请求 → 等待固定 task 槽位 → 转换为 BPS 请求 → 独立的上游 WebSocket → 转换为 Responses SSE 事件。上游只支持 WebSocket，旧 `--upstream-transport sse` 会被拒绝。每次本地请求建立自己的上游 WebSocket；发送生成请求后不会自动重连并重发。发送前的少数瞬时握手错误可安全重试，规则见排查表。
 
 客户端负责保留并发送需要的上下文。例如第二轮请求包含第一轮的提问与回答：
 
@@ -119,13 +120,37 @@ curl -N http://127.0.0.1:8790/v1/responses \
 }
 ```
 
-非空的 `previous_response_id` 会被拒绝，必须直接提供展开后的历史。本快照根据当前请求中的上下文等信息生成 BPS 元数据，不会自动追加其他客户端的上一轮文本。
+非空的 `previous_response_id` 会被拒绝，必须直接提供展开后的完整历史。每次请求只使用本次携带的上下文，不会自动追加其他客户端的上一轮文本或工具历史。客户端的 `session_id` 不用于选择上游 task 或共享历史；即使两个请求复用同一 task 槽位，也不会合并对话。
 
 客户端工具调用会转换成 BPS 可承载的形式并还原为 Responses 工具事件；工具实际执行仍由客户端负责。搜索、文件搜索、图像生成等上游托管工具会被过滤。独立 CLI 可接受 HTTPS 图片 URL，但没有配置图片中转服务，所以不能直接使用 base64/data URL 或文件 ID 图片。
 
 请求负载由调用方控制。上游返回 `request_rejected` 等错误时，CLI 将错误事件返回给调用方。
 
-## 5. 参数参考
+## 5. 并发、启动限速与持久状态
+
+默认每账号最多同时运行 `4` 个请求，对应 `4` 个固定 task 槽位。请求取得空闲槽位后，一直持有到生成和连接清理结束；槽位可以供后续请求复用。忙碌时最多允许 `64` 个请求等待，超出后返回 HTTP 429 `bps_queue_full`。`--max-pending 0` 关闭排队，忙碌时直接拒绝新请求。
+
+`--queue-timeout 30s` 是从进入队列起计算的排队及启动限速等待预算。取得槽位不会重置预算；启用 `--upstream-rps` 后，每次拨号（包括握手重试）和 `response.create` 的门控等待都受剩余预算约束。关闭启动限速时不产生这部分等待。此预算不截断已经开始的握手或生成；握手另有共享的 60 秒时限，`--ws-idle-timeout` 单独控制等待下一条上游事件的最长时间。
+
+`--upstream-rps` 默认 `0`，表示关闭启动限速，并发槽位仍然生效。设置为正整数时，每账号分别限制任意滚动 1 秒内的 WebSocket 拨号次数和 `response.create` 发送次数。每次拨号尝试（包括安全重试）均计数；一次生成不会因为经过两个门控就占用同一个计数两次。`--rate-wait-timeout` 限制单次启动门控等待时间，同时受剩余 `--queue-timeout` 约束；`--rate-max-pending` 限制等待启动的数量，设为 `0` 使用默认 `64`，不表示关闭排队。
+
+例如，允许最多 8 个活动请求，同时将拨号与生成启动各自限制为每秒 2 次：
+
+```bash
+./bps-local --proxy http://127.0.0.1:7890 \
+  --max-concurrent 8 --max-pending 64 --queue-timeout 30s \
+  --upstream-rps 2 --rate-wait-timeout 30s --rate-max-pending 64
+```
+
+这些参数是本地资源控制，不代表已验证的上游并发或速率额度；提高数值不保证上游会接受更多请求。
+
+状态目录按 `--state-dir`、`BPS_LOCAL_STATE_DIR`、`~/.bps-local/local-state` 的顺序选取。首次运行服务会在其中创建 `task.key` 和 `owner.lock`，用于维持 task 身份并独占目录。状态不包含 OAuth 凭据、对话历史或刷新状态。登录、`--check` 和协议诊断模式不创建或占用该目录。
+
+升级时先停止旧进程，替换二进制，再沿用原状态目录。正常重启会保留相同账号及槽位的 task 身份。不要删除或重建 `task.key`；已有 `owner.lock` 却缺少 key 时程序会拒绝启动，应恢复原 key。非 Windows 系统要求目录权限为 `0700`、文件为 `0600`；Windows 沿用父目录 ACL，并检查普通文件、符号链接和独占锁。
+
+同一个状态目录只允许一个服务进程持有。`owner.lock` 在停止后仍会保留，它的存在不代表进程仍在运行，也无需手动删除。多实例应使用不同监听端口和独立创建的状态目录，不要复制同一份 `task.key` 给并行实例。并发队列和速率限制均在进程内维护，不会跨实例合并。
+
+## 6. 参数参考
 
 | 参数 | 默认值 / 用途 |
 |---|---|
@@ -136,8 +161,15 @@ curl -N http://127.0.0.1:8790/v1/responses \
 | `--check` | 检查本地凭据信息，不验证上游生成 |
 | `--addr` | `127.0.0.1:8790`，仅允许回环地址 |
 | `--proxy` | 默认读取 `BPS_LOCAL_PROXY` |
-| `--upstream-transport` | `ws`；源码也保留旧 `sse` 模式，建议保持 `ws` |
+| `--upstream-transport` | `ws`，唯一支持的上游传输；旧 `sse` 会被拒绝 |
 | `--ws-idle-timeout` | `2m`，等待下一条上游 WS 事件的最长时间，不是总生成时长 |
+| `--max-concurrent` | `4`，每账号活动请求上限及固定 task 槽位数，范围 `1–10000` |
+| `--max-pending` | `64`，等待 task 槽位的请求上限；`0` 关闭排队 |
+| `--queue-timeout` | `30s`，排队及上游启动等待的总预算，必须大于 `0` |
+| `--state-dir` | `BPS_LOCAL_STATE_DIR` 或 `~/.bps-local/local-state`，须在重启时保留 |
+| `--upstream-rps` | `0`，关闭启动限速；正整数分别限制每账号滚动 1 秒的 WS 拨号和 `response.create`，最大 `10000` |
+| `--rate-wait-timeout` | `30s`，单次启动门控等待上限；`0` 使用默认值 |
+| `--rate-max-pending` | `64`，每账号等待启动的数量上限；`0` 使用默认值 |
 | `--bps-tools-version` | 空，使用上游默认工具版本；可显式指定版本 ID |
 | `--arc-text-session` | 默认关闭，实验性 ARC 文本初始化，不接受客户端工具 |
 | `--version` | 打印构建版本后退出 |
@@ -148,14 +180,18 @@ curl -N http://127.0.0.1:8790/v1/responses \
 
 诊断模式需要 `--proxy` 或 `BPS_LOCAL_PROXY`，会产生真实请求和用量；不能与登录、本地检查、ARC、版本输出或路径输出模式组合。它只记录协议观测，不判断账号是否“降智”，不改变账号状态。日常使用无需运行。
 
-## 6. 排查
+## 7. 排查
 
 | 现象 | 检查方向 |
 |---|---|
 | `bind: address already in use` | 原有进程已占用端口；使用另一个 `--addr` 或先停止已确认的旧进程 |
 | `OAuth destination exists` | 使用新的 `--auth` 路径，登录不会覆盖旧文件 |
+| 状态目录已被占用 | 停止持有该目录的旧服务，或为另一个实例指定独立 `--state-dir`；仅修改端口不够，不要删除正在使用的 `owner.lock` |
+| task key 缺失、无效或权限错误 | 恢复该状态目录原有的 `task.key` 并检查权限；不要用新 key 覆盖旧身份 |
+| `bps_queue_full` / `bps_queue_timeout` | 本地槽位等待队列已满或等待预算耗尽；减少并发调用，检查请求是否长时间占用槽位 |
+| `bps_rate_queue_full` / `bps_rate_wait_timeout` | 本地启动限速等待队列已满或等待超时；检查 `--upstream-rps`、等待预算和调用速率 |
 | `basispoints_auth_unavailable` / AT 过期 | 检查当前 OAuth 路径与有效期，重新授权后使用新文件 |
-| WS 握手失败 | 普通桥接仅对发送 `response.create` 之前的 EOF、连接重置和瞬时超时最多尝试 3 次（共享 60 秒预算）；错误包含安全的 `reason` / `attempts`。HTTP 拒绝、认证/证书错误不自动重试；发送请求后不重放。诊断模式仍仅尝试一次。持续失败请检查明确配置的代理、网络可达性、授权及上游兼容性 |
+| WS 握手失败 | 普通桥接仅对发送 `response.create` 之前的 EOF、连接重置和瞬时超时最多尝试 3 次，所有尝试共享同一个 60 秒握手预算，并响应请求取消；错误包含安全的 `reason` / `attempts`。开启启动限速时每次拨号均计数，门控等待受剩余启动等待预算约束。HTTP 拒绝、认证/证书错误不自动重试；发送请求后不重放。诊断模式仍仅尝试一次。持续失败请检查明确配置的代理、网络可达性、授权及上游兼容性 |
 | `basispoints_ws_timeout` | 等待下一条上游事件超时；检查代理与上游，可按实际需求调整超时时间 |
 | HTTP 200 后出现 `error` 事件 | 流已建立但生成失败，应读取事件体；不能只按 HTTP 状态判断成功 |
 | `request_rejected` | 上游拒绝了请求；该错误本身不能证明具体并发上限、固定请求次数或封控原因 |

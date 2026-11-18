@@ -255,9 +255,9 @@ func TestLiveWSSubprotocolAuthorization(t *testing.T) {
 	}
 	out := diagnoseGeneration(t, s, token, account)
 	out["authorization_header_removed"] = adapter.removed
-	out["change"] = "remove only Authorization from WS handshake; bearer subprotocol and account headers unchanged"
+	out["change"] = "verify subprotocol-only WS authentication; production already omits Authorization and account headers"
 	if adapter.removeAccounts {
-		out["change"] = "remove Authorization and both account selection headers; same bearer subprotocol retained"
+		out["change"] = "verify production WS authentication with defensive removal of account headers"
 	}
 	b, _ := json.MarshalIndent(out, "", "  ")
 	t.Log(string(b))

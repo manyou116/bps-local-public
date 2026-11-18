@@ -20,10 +20,12 @@ jobs:
       BPS_DIAGNOSTIC_GENERATE: "0"
     steps:
       - uses: actions/checkout@v4
+      - name: Check standalone source boundary
+        run: python scripts/check-standalone-boundary.py
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
           cache: true
       - run: go vet ./...
       - run: go test ./... -count=1 -timeout=120s
-      - run: go build ./...
+      - run: go build ./cmd/bps-local

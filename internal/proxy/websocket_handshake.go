@@ -23,20 +23,48 @@ const maxHandshakeAttempts = 3
 // dialWebSocket retries only classified transient failures before a successful
 // HTTP upgrade. No response.create has been written at this seam, so reconnecting
 // cannot replay a generation or tool operation. All attempts share one deadline.
-func (s *Server) dialWebSocket(ctx context.Context, address string, header http.Header, token string) (*websocket.Conn, func(), error) {
+func (s *Server) dialWebSocket(ctx context.Context, address string, header http.Header, token, admissionKey string) (*websocket.Conn, func(), func(), error) {
 	dialCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
+	timing := webSocketTimingFromContext(ctx)
+	dialWait := &startRateWaitObservation{}
+	dialWaitCtx := context.WithValue(dialCtx, startRateWaitKey{}, dialWait)
+	timing.handshakeWaitObserved = true
+	defer func() { timing.handshakeWait = dialWait.elapsed }()
 	for attempt := 1; ; attempt++ {
 		// Every attempt owns its connections; never recycle a failed connection
-		// or close another concurrent request's transport.
+		// or close another concurrent request's transport. The successful socket
+		// follows the request lifetime, not the shorter handshake budget.
 		client, release := scopedWebSocketClient(ctx, s.client)
-		conn, resp, err := websocket.Dial(dialCtx, address, &websocket.DialOptions{
-			HTTPClient: client, HTTPHeader: header,
-			Subprotocols: []string{"responses", "openai-bearer." + token},
+		upgradeTransport := &webSocketUpgradeTransport{base: client.Transport}
+		if upgradeTransport.base == nil {
+			upgradeTransport.base = http.DefaultTransport
+		}
+		requestClient := *client
+		requestClient.Transport = upgradeTransport
+		var conn *websocket.Conn
+		var resp *http.Response
+		err := s.dialRates.runDispatch(dialWaitCtx, admissionKey, s.startAuthorization, s.startDeadline, func(releaseDispatch func()) error {
+			// Each retry consumes a dial start and rechecks authorization. Release
+			// before network I/O so slow handshakes can overlap permitted dials.
+			if timing.dialStart.IsZero() {
+				timing.dialStart = time.Now()
+			}
+			releaseDispatch()
+			var dialErr error
+			conn, resp, dialErr = websocket.Dial(dialCtx, address, &websocket.DialOptions{
+				HTTPClient: &requestClient, HTTPHeader: header,
+				Subprotocols: []string{"responses", "openai-bearer." + token},
+			})
+			timing.dialDone = time.Now()
+			if resp != nil {
+				timing.handshakeStatus = resp.StatusCode
+			}
+			return dialErr
 		})
 		protocolObserverFromContext(ctx).observeHandshake(resp)
 		if err == nil {
-			return conn, release, nil
+			return conn, release, upgradeTransport.abort, nil
 		}
 		if conn != nil {
 			_ = conn.CloseNow()
@@ -44,11 +72,19 @@ func (s *Server) dialWebSocket(ctx context.Context, address string, header http.
 		if resp != nil && resp.Body != nil {
 			_ = resp.Body.Close()
 		}
+		upgradeTransport.abort()
 		release()
+		var pacing *StartRateError
+		if errors.As(err, &pacing) {
+			return nil, nil, nil, err
+		}
+		if ctx.Err() != nil {
+			return nil, nil, nil, ctx.Err()
+		}
 		// Preserve explicit upstream status/Retry-After. Authentication errors,
 		// rate limits, redirects and HTTP rejections are never hidden by retries.
 		if resp != nil && resp.StatusCode != http.StatusSwitchingProtocols {
-			return nil, nil, &upstreamRejection{status: resp.StatusCode, retry: retryafter.Seconds(resp.Header.Get("Retry-After"))}
+			return nil, nil, nil, &upstreamRejection{status: resp.StatusCode, retry: retryafter.Seconds(resp.Header.Get("Retry-After"))}
 		}
 		reason, transient := handshakeFailureKind(err)
 		if resp != nil {
@@ -62,13 +98,13 @@ func (s *Server) dialWebSocket(ctx context.Context, address string, header http.
 		// redirect URL, proxy credentials or upstream-controlled response text.
 		failure := fmt.Errorf("WebSocket handshake failed (reason=%s; attempts=%d; request_not_sent=true); check proxy, credentials and upstream WebSocket support", reason, attempt)
 		if !retry {
-			return nil, nil, failure
+			return nil, nil, nil, failure
 		}
 		timer := time.NewTimer(time.Duration(attempt) * 250 * time.Millisecond)
 		select {
 		case <-dialCtx.Done():
 			timer.Stop()
-			return nil, nil, failure
+			return nil, nil, nil, failure
 		case <-timer.C:
 		}
 	}

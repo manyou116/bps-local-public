@@ -2,7 +2,7 @@
 
 `bps-local --protocol-diagnostic` 使用已有的独立 BPS OAuth 文件，通过指定代理向 BPS 发送最多两次短 WebSocket 请求，并保存脱敏 JSON 报告。它用于观察协议信号，不评定模型质量，也不会根据门票或模型字段差异声明账号“降智”。
 
-该命令不启动 HTTP 监听，不占用 `8790`，不调用 CPA 管理接口，不改变 CPA 的账号启停或调度状态。它不执行设备登录，不交换 refresh token，不修改 OAuth 文件。真实运行会产生 BPS 请求，可能消耗对应账号的请求额度。
+该命令不启动 HTTP 监听，不占用 `8790`，不创建或锁定独立 CLI 的 task 状态目录。它不执行设备登录，不交换 refresh token，不修改 OAuth 文件。真实运行会产生 BPS 请求，可能消耗对应账号的请求额度。
 
 ## 运行
 
@@ -27,9 +27,12 @@ go build -o bps-local ./cmd/bps-local
 | `--diagnostic-effort` | `medium` | 请求的推理强度，可选 `none`、`low`、`medium`、`high`、`xhigh` |
 | `--diagnostic-output` | `bps-protocol-diagnostic.json` | 新报告文件路径，父目录必须已经存在 |
 | `--ws-idle-timeout` | `2m` | 上游 WebSocket 事件等待时间 |
+| `--upstream-rps` | `0` | 关闭启动限速；正整数分别限制每账号滚动 1 秒内的 WS 拨号和 `response.create` 次数 |
+| `--rate-wait-timeout` | `30s` | 启用启动限速时的门控等待上限；`0` 使用默认值 |
+| `--rate-max-pending` | `64` | 启动限速等待队列上限；`0` 使用默认值 |
 | `--bps-tools-version` | 空 | 可选 BPS 工具版本，不指定时由服务端决定 |
 
-此模式只使用 WebSocket，拒绝与 `--upstream-transport sse`、`--login`、`--check`、`--arc-text-session`、`--version`、`--auth-path` 组合。普通桥接模式的监听参数不参与此次执行。
+此模式只使用 WebSocket，拒绝与 `--upstream-transport sse`、`--login`、`--check`、`--arc-text-session`、`--version`、`--auth-path` 组合。普通桥接模式的监听、task 槽位、排队和状态目录参数不参与此次执行。
 
 ## 两次请求的含义
 

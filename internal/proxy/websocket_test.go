@@ -77,19 +77,32 @@ func completeWS(t *testing.T, ctx context.Context, c *websocket.Conn, output []a
 }
 
 func TestWebSocketHandshakeAndStreaming(t *testing.T) {
+	var expectedToken string
 	up := wsMock(t, func(ctx context.Context, c *websocket.Conn, doc map[string]any, r *http.Request) {
 		if r.Method != "GET" || r.ProtoMajor != 1 || c.Subprotocol() != "responses" {
 			t.Errorf("not a Responses HTTP/1.1 upgrade")
 		}
-		token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-		if token == "" || !strings.Contains(r.Header.Get("Sec-WebSocket-Protocol"), "openai-bearer."+token) {
-			t.Error("missing handshake credentials")
+		var token string
+		for _, protocol := range strings.Split(r.Header.Get("Sec-WebSocket-Protocol"), ",") {
+			protocol = strings.TrimSpace(protocol)
+			if strings.HasPrefix(protocol, "openai-bearer.") {
+				token = strings.TrimPrefix(protocol, "openai-bearer.")
+			}
+		}
+		if token == "" || token != expectedToken {
+			t.Error("missing or incorrect handshake credentials")
 		}
 		if strings.Contains(r.URL.RawQuery, token) || r.Header.Get("Cookie") != "" {
 			t.Error("credentials in query or copied browser cookie")
 		}
-		if r.Header.Get("Chatgpt-Account-Id") != "acct-test" {
-			t.Error("missing account scope")
+		for name := range r.Header {
+			k := strings.ToLower(name)
+			if k == "authorization" || k == "chatgpt-account-id" || k == "content-type" || strings.HasPrefix(k, "x-openai-") || strings.HasPrefix(k, "x-basispoints-") {
+				t.Errorf("unexpected REST header on WebSocket: %s", name)
+			}
+		}
+		if r.Header.Get("Origin") != "https://bps.openai.com" || r.Header.Get("X-Custom") != "retained" {
+			t.Error("missing origin or allowed custom header")
 		}
 		q := r.URL.Query()
 		var profile map[string]string
@@ -123,7 +136,11 @@ func TestWebSocketHandshakeAndStreaming(t *testing.T) {
 		_ = c.Write(ctx, websocket.MessageText, []byte("{\n\"type\":\"response.output_text.delta\",\n\"delta\":\"你好\\nworld\"\n}"))
 		completeWS(t, ctx, c, []any{})
 	})
-	s := wsBridge(t, up, func(c *Config) { c.ToolsVersion = "test-tools-version" })
+	s := wsBridge(t, up, func(c *Config) {
+		c.ToolsVersion = "test-tools-version"
+		c.Headers = map[string]string{"X-Custom": "retained", "Authorization": "bad", "Chatgpt-Account-Id": "bad", "X-Openai-Account-Id": "bad", "X-Basispoints-Auth-Mode": "bad", "X-Openai-Internal-Basispoints-Client-Product": "bad", "Cookie": "bad", "Origin": "https://example.invalid", "Sec-WebSocket-Protocol": "bad"}
+	})
+	expectedToken, _, _ = s.store.Credentials()
 	rec := postResponses(t, s.Handler(), basicBody())
 	body := rec.Body.String()
 	if rec.Code != 200 || !strings.Contains(body, `你好\nworld`) || !strings.Contains(body, "response.completed") || !strings.Contains(body, "reported-model") {
@@ -381,6 +398,9 @@ func TestWebSocketUsesConfiguredHTTPProxy(t *testing.T) {
 
 func TestInvalidUpstreamConfig(t *testing.T) {
 	for _, cfg := range []Config{
+		{UpstreamTransport: "sse"},
+		{Upstream: "https://BPS.OPENAI.COM:443/basispoints/api/responses", UpstreamTransport: "sse"},
+		{Upstream: "wss://bps.openai.com./basispoints/api/responses", UpstreamTransport: "sse"},
 		{UpstreamTransport: "unknown"}, {Upstream: "file:///tmp/a"},
 		{Upstream: "ws://example.com/responses"}, {WSIdleTimeout: -time.Second},
 	} {

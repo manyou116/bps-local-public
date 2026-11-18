@@ -6,13 +6,27 @@
 #         dist/bps-local-<version>-<os>-<arch>.tar.gz (others)
 set -euo pipefail
 
-VERSION="${1:-}"
-if [ -z "$VERSION" ]; then
-  VERSION="$(grep -oP '(?<=^var version = ")[^"]+' cmd/bps-local/main.go 2>/dev/null || echo dev)"
-fi
+# macOS tar otherwise adds AppleDouble entries with local extended attributes.
+export COPYFILE_DISABLE=1
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+
+VERSION="${1:-}"
+if [ -z "$VERSION" ]; then
+  VERSION="$(sed -n 's/^var version = "\([^"]*\)"$/\1/p' cmd/bps-local/main.go)"
+  VERSION="${VERSION:-dev}"
+fi
+if [[ ! "$VERSION" =~ ^[[:alnum:]][[:alnum:]._-]*$ ]]; then
+  echo "version must contain only letters, digits, dots, underscores or hyphens" >&2
+  exit 1
+fi
+
+if command -v python3 >/dev/null 2>&1; then
+  python3 scripts/check-standalone-boundary.py
+else
+  python scripts/check-standalone-boundary.py
+fi
 
 DIST="$ROOT/dist"
 rm -rf "$DIST"

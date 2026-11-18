@@ -4,13 +4,25 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptrace"
 	"strings"
 
+	"github.com/sunboyzoey/GPT-BPS/internal/auth"
 	"github.com/sunboyzoey/GPT-BPS/internal/retryafter"
 )
+
+// Real JWT claims take precedence over an externally supplied account field.
+// Legacy standalone sources without JWT claims retain their explicit account.
+func admissionKeyForToken(token, accountID string) string {
+	if key := auth.AdmissionKeyFromToken(token); key != "" {
+		return key
+	}
+	return auth.AdmissionKey(accountID, "")
+}
 
 type upstreamRejection struct {
 	status int
@@ -49,8 +61,22 @@ func (s *Server) openUpstream(ctx context.Context, body []byte, token, accountID
 	}
 	applyUpstreamHeaders(req, token, accountID)
 	s.applyCustomHeaders(req)
-	resp, err := s.client.Do(req)
+	var resp *http.Response
+	err = s.startRates.runDispatch(ctx, admissionKeyForToken(token, accountID), s.startAuthorization, s.startDeadline, func(release func()) error {
+		// Release the dispatch gate after writing the request, not after waiting
+		// for response headers. The rate limit must not serialize whole streams.
+		req = req.WithContext(httptrace.WithClientTrace(req.Context(), &httptrace.ClientTrace{
+			WroteRequest: func(httptrace.WroteRequestInfo) { release() },
+		}))
+		var sendErr error
+		resp, sendErr = s.client.Do(req)
+		return sendErr
+	})
 	if err != nil {
+		var pacing *StartRateError
+		if errors.As(err, &pacing) || ctx.Err() != nil {
+			return nil, err
+		}
 		return nil, fmt.Errorf("could not reach upstream SSE endpoint")
 	}
 	if resp.StatusCode != http.StatusOK {

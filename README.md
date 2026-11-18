@@ -2,13 +2,13 @@
 
 **QQ 交流群：`1135421637`** · 项目使用与问题交流。
 
-将本机的 Responses API 请求转换为 ChatGPT Excel / Basispoints（BPS）请求的 Go 命令行桥接器。客户端通过 HTTP 发送请求、通过 SSE 接收事件；桥接器默认通过 WebSocket 连接 BPS 上游。
+将本机的 Responses API 请求转换为 ChatGPT Excel / Basispoints（BPS）请求的 Go 命令行桥接器。客户端通过 HTTP 发送请求、通过 SSE 接收事件；桥接器通过 WebSocket 连接 BPS 上游。
 
 ```text
 Responses 客户端 → http://127.0.0.1:8790/v1/responses → BPS WebSocket
 ```
 
-本目录是 **2026-11-06 提交 `8736c9f` 的独立 CLI 源码快照**，不包含 CPA 插件或管理服务。BPS 属于产品内部接口，本项目并非 OpenAI 官方项目；接口、授权方式和模型权限可能变化，代码可构建不代表目前的上游请求一定成功。
+本仓库只发布独立 CLI，不包含 CPA 插件或管理服务。BPS 属于产品内部接口，本项目并非 OpenAI 官方项目；接口、授权方式和模型权限可能变化，代码可构建不代表目前的上游请求一定成功。
 
 ## 快速开始
 
@@ -46,7 +46,10 @@ curl -N http://127.0.0.1:8790/v1/responses \
 
 - 支持 Responses 文本输入、客户端工具调用转换，以及上游事件到本地 SSE 的转换。
 - 每个进程使用一份独立 OAuth 文件；没有多账号管理界面、账号轮询或模型列表接口。
-- 多轮上下文由调用方在每次请求中提供；请求负载由调用方控制。
+- 使用固定 task 槽位池：默认每账号并发 `4`、等待队列 `64`、排队及上游启动等待预算 `30s`。这些是本地配置，不代表上游允许的并发。
+- 可选 `--upstream-rps` 分别限制每账号的 WebSocket 拨号和 `response.create` 启动速率，默认 `0`（关闭限速，仍保留并发限制）。握手安全重试也计入拨号限制。
+- 每次请求自带完整上下文，不跨客户端追加历史；不支持 `previous_response_id`。复用 task 槽位不会复用调用方的对话历史。
+- task 身份保存在 `~/.bps-local/local-state`，重启沿用；同一状态目录同时只允许一个服务进程使用。
 - 独立 CLI 的图片输入使用 HTTPS 图片 URL；不提供内联图片的公开托管地址。
 - 不执行 Excel 工作簿操作，不提供上游托管的搜索、文件搜索或图像生成工具。
 - OAuth 文件可保存 Access Token、Refresh Token 和有效期等元数据，但 **CLI 不自动使用 Refresh Token 刷新授权**。登录完成和 `--check` 均不验证真实生成权限。
@@ -58,7 +61,21 @@ Windows 构建使用 `go build -o bps-local.exe ./cmd/bps-local`。附带的启�
 .\bps.ps1 -Proxy http://127.0.0.1:7890
 ```
 
-完整参数、上下文示例及故障排查见 [使用说明](docs/USAGE.md)。`--upstream-transport sse` 是源码保留的旧兼容选项，日常使用保持默认 `ws`。
+完整参数、上下文示例及故障排查见 [使用说明](docs/USAGE.md)。上游只支持 `ws`；`--upstream-transport sse` 会被拒绝，本地 Responses 接口仍返回 SSE。
+
+## 升级与状态目录
+
+停止旧进程后替换二进制，保留原 OAuth 文件和 `--state-dir` 目录。首次启动会创建 `task.key` 与 `owner.lock`；后续重启请沿用它们，不要把该目录当作缓存清理。状态目录不保存 OAuth 凭据或对话历史。
+
+需要同时启动多个实例时，为每个实例指定不同的 `--addr` 和独立的 `--state-dir`。并发和限速均在各进程内生效，不会跨进程合并。同一个状态目录被占用时，新进程会明确拒绝启动。
+
+例如，在默认并发下启用每秒两次的启动限制：
+
+```bash
+./bps-local --proxy http://127.0.0.1:7890 --upstream-rps 2
+```
+
+发布包由 `scripts/package.sh` 仅构建 `./cmd/bps-local`，附带使用文档、许可、占位凭据示例及 Windows 启动脚本。
 
 ## 许可与来源
 

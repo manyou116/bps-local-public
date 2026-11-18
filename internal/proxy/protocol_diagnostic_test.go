@@ -71,7 +71,7 @@ func TestProtocolDiagnosticObservesBPSWithoutInventingQualityVerdict(t *testing.
 					t.Error("not a normal BPS request")
 				}
 				sessions = append(sessions, request["metadata"].(map[string]any)["task_id"].(string))
-				if r.Header.Get("Authorization") != "Bearer "+diagnosticTestCredentials().token || r.Header.Get("Origin") != "https://bps.openai.com" {
+				if r.Header.Get("Authorization") != "" || !strings.Contains(r.Header.Get("Sec-WebSocket-Protocol"), "openai-bearer."+diagnosticTestCredentials().token) || r.Header.Get("Origin") != "https://bps.openai.com" {
 					t.Error("wrong BPS credential or client profile")
 				}
 				headers := map[string]string{"X-OpenAI-Internal-Basispoints-Agent-Prompt-Sha256": "private-prompt-hash", "Set-Cookie": "private-metadata-cookie"}

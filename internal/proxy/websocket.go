@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -15,6 +16,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/coder/websocket"
@@ -22,6 +24,48 @@ import (
 
 // Leave space for SSE framing below the existing bridge's 16 MiB event limit.
 const maxWSMessage = (16 << 20) - 1024
+
+// Terminal output is already delivered; do not hold the request open for the
+// library's full close-handshake timeout if the peer stops responding.
+const webSocketCloseTimeout = time.Second
+
+// websocket.Dial takes ownership of the upgraded response body and removes it
+// from the returned response. Retain an idempotent close handle so cancellation
+// and our shorter deadline can interrupt Close even for custom transports.
+// Calling Conn.CloseNow concurrently with Conn.Close cannot do that: once the
+// library starts closing, further close calls only wait for the first one.
+type webSocketUpgradeTransport struct {
+	base   http.RoundTripper
+	socket *webSocketUpgradeBody
+}
+
+type webSocketUpgradeBody struct {
+	io.ReadWriteCloser
+	once sync.Once
+	err  error
+}
+
+func (b *webSocketUpgradeBody) Close() error {
+	b.once.Do(func() { b.err = b.ReadWriteCloser.Close() })
+	return b.err
+}
+
+func (t *webSocketUpgradeTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	resp, err := t.base.RoundTrip(r)
+	if err == nil && resp.StatusCode == http.StatusSwitchingProtocols {
+		if socket, ok := resp.Body.(io.ReadWriteCloser); ok {
+			t.socket = &webSocketUpgradeBody{ReadWriteCloser: socket}
+			resp.Body = t.socket
+		}
+	}
+	return resp, err
+}
+
+func (t *webSocketUpgradeTransport) abort() {
+	if t.socket != nil {
+		_ = t.socket.Close()
+	}
+}
 
 // excelClientInfo mirrors the public client profile seen in the Excel capture.
 // No cookies, account IDs, tokens, prompt versions or captured session IDs are
@@ -54,6 +98,13 @@ func newRequestID() string {
 }
 
 func (s *Server) openWebSocket(ctx context.Context, body []byte, token, accountID string) (io.ReadCloser, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	admissionKey := admissionKeyForToken(token, accountID)
+	if err := s.startRates.check(admissionKey, s.startAuthorization); err != nil {
+		return nil, err
+	}
 	var doc map[string]json.RawMessage
 	if err := json.Unmarshal(body, &doc); err != nil || doc == nil {
 		return nil, fmt.Errorf("invalid prepared WebSocket request")
@@ -102,14 +153,14 @@ func (s *Server) openWebSocket(ctx context.Context, body []byte, token, accountI
 	u.RawQuery = q.Encode()
 
 	request, _ := http.NewRequest(http.MethodGet, u.String(), nil)
-	applyUpstreamHeaders(request, token, accountID)
-	s.applyCustomHeaders(request)
-	request.Header.Del("Content-Type")
+	// Browser BPS WebSockets carry authentication in the subprotocol and
+	// client metadata in the query. Do not reuse the REST endpoint headers:
+	// duplicate identity carriers can disagree with the selected grant.
+	request.Header.Set("Origin", "https://bps.openai.com")
+	request.Header.Set("User-Agent", "Mozilla/5.0")
 	request.Header.Set("Accept", "*/*")
-	for name, value := range profile {
-		request.Header.Set(name, value)
-	}
-	conn, releaseTransport, err := s.dialWebSocket(ctx, u.String(), request.Header, token)
+	s.applyCustomHeaders(request)
+	conn, releaseTransport, abortTransport, err := s.dialWebSocket(ctx, u.String(), request.Header, token, admissionKey)
 	if err != nil {
 		return nil, err
 	}
@@ -119,16 +170,26 @@ func (s *Server) openWebSocket(ctx context.Context, body []byte, token, accountI
 			releaseTransport()
 		}
 	}()
+	timing := webSocketTimingFromContext(ctx)
 	observer := protocolObserverFromContext(ctx)
 	conn.SetReadLimit(maxWSMessage)
 	if s.cfg.Verbose {
 		log.Printf("upstream ws handshake=101")
 	}
-	writeCtx, cancelWrite := context.WithTimeout(ctx, 30*time.Second)
-	err = conn.Write(writeCtx, websocket.MessageText, payload)
-	cancelWrite()
+	err = s.startRates.run(ctx, admissionKey, s.startAuthorization, s.startDeadline, func() error {
+		writeCtx, cancelWrite := context.WithTimeout(ctx, 30*time.Second)
+		defer cancelWrite()
+		timing.writeStart = time.Now()
+		writeErr := conn.Write(writeCtx, websocket.MessageText, payload)
+		timing.writeDone = time.Now()
+		return writeErr
+	})
 	if err != nil {
 		_ = conn.CloseNow()
+		var pacing *StartRateError
+		if errors.As(err, &pacing) || ctx.Err() != nil {
+			return nil, err
+		}
 		return nil, fmt.Errorf("could not send WebSocket response.create; request was not retried")
 	}
 	readCtx, cancelRead := context.WithCancel(ctx)
@@ -137,10 +198,12 @@ func (s *Server) openWebSocket(ctx context.Context, body []byte, token, accountI
 	transferred = true
 	return &webSocketBody{
 		releaseTransport: releaseTransport,
+		abortTransport:   abortTransport,
 		conn:             conn, ctx: readCtx, cancel: cancelRead,
 		idleTimeout: s.cfg.WSIdleTimeout, pending: bytes.NewReader(nil),
 		requestedModel: requestedModel, verbose: s.cfg.Verbose,
-		observer: observer,
+		observer:    observer,
+		rejectStart: func() { s.rejectStarts(admissionKey) },
 	}, nil
 }
 
@@ -149,21 +212,40 @@ func (s *Server) openWebSocket(ctx context.Context, body []byte, token, accountI
 // Bridge.Stream owns the reader goroutine; no second pump is needed here.
 type webSocketBody struct {
 	releaseTransport func()
+	abortTransport   func()
 	conn             *websocket.Conn
 	ctx              context.Context
 	cancel           context.CancelFunc
 	idleTimeout      time.Duration
 	pending          *bytes.Reader
 	terminal         bool
+	upstreamTerminal atomic.Bool
 	requestedModel   string
 	verbose          bool
 	observer         protocolObserver
+	rejectStart      func()
 	closeOnce        sync.Once
 	eventCount       int
 }
 
 func (b *webSocketBody) Close() error {
 	b.closeOnce.Do(func() {
+		if b.upstreamTerminal.Load() && b.ctx.Err() == nil {
+			// Only a terminal event received from upstream permits normal close.
+			// Locally synthesized failures, cancellation and premature disconnects
+			// keep the immediate-close behavior and never retry the request.
+			ctx, cancel := context.WithTimeout(b.ctx, webSocketCloseTimeout)
+			aborted := make(chan struct{})
+			stop := context.AfterFunc(ctx, func() {
+				b.abortTransport()
+				close(aborted)
+			})
+			_ = b.conn.Close(websocket.StatusNormalClosure, "")
+			if !stop() {
+				<-aborted
+			}
+			cancel()
+		}
 		b.cancel()
 		_ = b.conn.CloseNow()
 		if b.releaseTransport != nil {
@@ -211,6 +293,9 @@ func (b *webSocketBody) Read(p []byte) (int, error) {
 			continue
 		}
 		b.eventCount++
+		if b.rejectStart != nil && isStartRejection(eventType, event) {
+			b.rejectStart()
+		}
 		if b.verbose {
 			// Only protocol event names; never log response bodies or tokens.
 			if b.eventCount == 1 || eventType == "error" || eventType == "response.completed" || eventType == "response.failed" {
@@ -234,6 +319,9 @@ func (b *webSocketBody) Read(p []byte) (int, error) {
 		}
 		delete(event, "basispoints_replay_cursor")
 		b.terminal = eventType == "response.completed" || eventType == "response.failed" || eventType == "response.incomplete" || eventType == "error"
+		if b.terminal {
+			b.upstreamTerminal.Store(true)
+		}
 		if b.verbose && eventType == "response.completed" {
 			var response struct {
 				Model string `json:"model"`

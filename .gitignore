@@ -36,3 +36,7 @@ __pycache__/
 /runtime/
 /auths/
 /.bps-local/
+/local-state/
+owner.lock
+task.key
+.task-key-*

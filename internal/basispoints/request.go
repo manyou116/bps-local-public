@@ -71,8 +71,48 @@ func message(role, content string) object {
 	return object{"type": "message", "role": role, "content": []any{object{"type": "input_text", "text": content}}}
 }
 
-// Prepare preserves the requested model and uses a whitelist for the Excel wire body.
+// PrepareOptions separates server-owned upstream task identity from local
+// history/replay scope. SessionID preserves the standalone compatibility path.
+// UpstreamTaskID and UpstreamTurnID are trusted server options, not client fields.
+type PrepareOptions struct {
+	SessionID      string
+	UpstreamTaskID string
+	UpstreamTurnID string
+}
+
+func validUpstreamIdentity(value string) bool {
+	if len(value) != 64 || strings.ToLower(value) != value {
+		return false
+	}
+	_, err := hex.DecodeString(value)
+	return err == nil
+}
+
+// Validate rejects partial or malformed trusted identity overrides before any
+// request adaptation, image rewriting, or replay-cache writes are attempted.
+func (o PrepareOptions) Validate() error {
+	if o.UpstreamTaskID == "" && o.UpstreamTurnID == "" {
+		return nil
+	}
+	if !validUpstreamIdentity(o.UpstreamTaskID) || !validUpstreamIdentity(o.UpstreamTurnID) {
+		return fmt.Errorf("invalid server-owned upstream task identity")
+	}
+	return nil
+}
+
+// Prepare preserves the legacy content-derived conversation identity. Callers
+// with an explicit logical session use PrepareWithOptions instead.
 func Prepare(raw []byte, scope string, replay *ReplayCache) ([]byte, *Bridge, error) {
+	return PrepareWithOptions(raw, scope, replay, PrepareOptions{})
+}
+
+// PrepareWithOptions preserves the requested model and uses a whitelist for the
+// Excel wire body. A logical session changes task identity only, never history.
+func PrepareWithOptions(raw []byte, scope string, replay *ReplayCache, options PrepareOptions) ([]byte, *Bridge, error) {
+	hasUpstreamIdentity := options.UpstreamTaskID != "" || options.UpstreamTurnID != ""
+	if err := options.Validate(); err != nil {
+		return nil, nil, err
+	}
 	var source object
 	if err := decode(raw, &source); err != nil || source == nil {
 		return nil, nil, fmt.Errorf("invalid Basispoints request JSON")
@@ -222,6 +262,13 @@ func Prepare(raw []byte, scope string, replay *ReplayCache) ([]byte, *Bridge, er
 	if conversation == "" && len(input) > 0 {
 		conversation = fingerprint(input[0])
 	}
+	taskID := fingerprint([]any{scope, conversation})
+	sessionID := strings.TrimSpace(options.SessionID)
+	if sessionID != "" {
+		// Keep an explicit conversation stable when the client trims history or
+		// changes prompt_cache_key. The scope still isolates accounts/callers.
+		taskID = fingerprint([]any{"bps-session-v1", scope, sessionID})
+	}
 	turnEnd := 0
 	if len(input) > 0 {
 		turnEnd = 1
@@ -237,13 +284,23 @@ func Prepare(raw []byte, scope string, replay *ReplayCache) ([]byte, *Bridge, er
 			iteration++
 		}
 	}
+	turnID := fingerprint([]any{scope, input[:turnEnd]})
+	if sessionID != "" {
+		turnID = fingerprint([]any{"bps-turn-v1", taskID, input[:turnEnd]})
+	}
+	if hasUpstreamIdentity {
+		// A leased account slot may serve multiple callers. Only these upstream
+		// metadata values are shared; b.scope and all local replay keys remain
+		// scoped to the original caller, authorization and logical conversation.
+		taskID, turnID = options.UpstreamTaskID, options.UpstreamTurnID
+	}
 	output := object{
 		"model": model, "model_selection": "explicit", "stream": true, "store": false,
 		"input": append(prologue, translated...), "reasoning_effort": effort,
 		"context_management": []any{object{"type": "compaction", "compact_threshold": 200000}},
 		"metadata": object{
-			"task_id": fingerprint([]any{scope, conversation}),
-			"turn_id": fingerprint([]any{scope, input[:turnEnd]}), "agent_iteration": fmt.Sprint(iteration),
+			"task_id": taskID,
+			"turn_id": turnID, "agent_iteration": fmt.Sprint(iteration),
 		},
 	}
 	if cacheKey != "" {
