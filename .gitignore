@@ -16,6 +16,10 @@ bps-run.log
 # Local credentials (the example file contains placeholders only)
 oauth.json
 auth.json
+/auth-*.json
+/browser-oauth.json
+/accounts.json
+/accounts-*.json
 *.har
 
 # Python helper bytecode

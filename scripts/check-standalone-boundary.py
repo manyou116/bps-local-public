@@ -9,7 +9,9 @@ import sys
 ROOT = Path(__file__).resolve().parent.parent
 TOP_FILES = {
     ".dockerignore", ".gitattributes", ".gitignore", "Dockerfile", "LICENSE",
-    "README.md", "go.mod", "go.sum", "bps.ps1", "bps-codex.ps1", "oauth.example.json",
+    "README.md", "accounts.example.json", "go.mod", "go.sum", "bps.ps1", "bps-codex.ps1",
+    "compose.yaml", "compose.accounts.yaml",
+    "oauth.example.json",
 }
 WORKFLOWS = {"ci.yml", "docker.yml"}
 PACKAGES = {"auth", "basispoints", "gateway", "proxy", "retryafter", "sanitize"}

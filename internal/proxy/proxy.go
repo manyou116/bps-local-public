@@ -406,7 +406,7 @@ func IsLoopback(addr string) bool {
 	}
 
 	host = strings.Trim(strings.TrimSpace(host), "[]")
-	if host == "" || strings.EqualFold(host, "localhost") {
+	if strings.EqualFold(host, "localhost") {
 		return true
 	}
 	ip := net.ParseIP(host)
@@ -429,10 +429,14 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 // ListenAndServeHandler preserves the loopback and lifecycle restrictions while
 // allowing an admission wrapper around the ordinary Responses handler.
 func (s *Server) ListenAndServeHandler(ctx context.Context, handler http.Handler) error {
+	return ListenAndServeHandler(ctx, s.cfg.Addr, handler)
+}
+
+// ListenAndServeHandler serves handlers sharing one loopback listener.
+func ListenAndServeHandler(ctx context.Context, addr string, handler http.Handler) error {
 	if handler == nil {
 		return errors.New("bridge handler is required")
 	}
-	addr := s.cfg.Addr
 	if addr == "" {
 		addr = "127.0.0.1:8790"
 	}

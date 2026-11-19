@@ -56,6 +56,16 @@ curl -N http://127.0.0.1:8790/v1/responses \
 
 本地接口仅监听回环地址，不要求客户端提供 API Key。它返回流式事件；应检查最终事件和内容，HTTP 连接成功不等于生成成功。
 
+### 单进程多账号（按 API Key 路由）
+
+用 [accounts.example.json](accounts.example.json) 作为模板配置 `accounts.json`，每个账号只需指定一份自己的 `auth` 文件和一把独立的 `api_key`。账号按数组顺序使用 `account-1`、`account-2` 等内部状态目录；`id` 不需要配置。例如用 `openssl rand -hex 32` 分别生成两把 Key；**这里填的是本地 API Key，不是 OpenAI API Key 或 OAuth Access Token**。相对 `auth` 路径以 `accounts.json` 所在目录为准。将 `accounts.json` 和 OAuth 文件设为 `600`，不要提交或分享。
+
+```bash
+./bps-local --accounts ./accounts.json
+```
+
+各客户端使用同一个地址 `http://127.0.0.1:8790/v1`，用 `Authorization: Bearer <api_key>` 选定账号。缺失或错误的 Key 返回 `401`，不会回退到其他账号。每个账号有独立的任务状态和队列；`--proxy` 使用共同的出口。`/healthz` 仅检查进程是否存活，不验证各账号的 OAuth。配置更改后重启服务。此前的 `--auth` 单账号模式不受影响。
+
 ## Docker（Linux）
 
 GitHub Actions 在推送 `main` 或 `v*` 标签时构建并发布 `linux/amd64`、`linux/arm64` 镜像到 `ghcr.io/sunboyzoey/bps-local-public`。`main` 更新 `latest` 和 `sha-<提交 SHA>`，版本标签保留原名。面向 `main` 的 PR 只验证构建，不发布。首次发布后，如需让其他人匿名拉取，请在 GitHub Package 设置中确认可见性为 Public。
@@ -73,10 +83,33 @@ docker run --rm --network host --user "$(id -u):$(id -g)" \
 
 授权保存到了其他文件时，替换第一个挂载的 `src`。没有本地代理时，省略 `--proxy`。镜像内没有浏览器，不支持在容器内进行浏览器授权。
 
+### Docker Compose 多账号
+
+需要一个端口按 Key 路由时，用 [compose.accounts.yaml](compose.accounts.yaml)。保持 `accounts.json`、`auth-a.json`、`auth-b.json` 和 Compose 文件同目录；普通 Linux Docker 上，默认镜像用户 UID `65532` 必须能读取这三个 `600` 文件。然后运行 `docker compose -f compose.accounts.yaml up -d --build`。增加账号时增添配置项和对应的只读凭据挂载。它与下方的多端口配置默认都使用 `8790`，不要同时启动，或用 `BPS_PORT` 给按 Key 路由的容器换一个端口。
+
+### Docker Compose 多端口
+
+[compose.yaml](compose.yaml) 在一份配置里启动两个容器：`bps-a` 监听 `127.0.0.1:8790`，`bps-b` 监听 `127.0.0.1:8791`。每个账号有自己的 OAuth 文件和 Docker 状态卷，客户端按端口选账号；没有账号轮询或统一入口。
+
+在 Linux 服务器上把两份独立授权文件放在 `compose.yaml` 同目录，命名为 `auth-a.json` 和 `auth-b.json`。Compose 使用默认镜像的非 root 用户（UID `65532`）。以下命令适用于未启用用户命名空间映射的 Linux Docker：
+
+```bash
+sudo chmod 600 auth-a.json auth-b.json
+sudo chown 65532 auth-a.json auth-b.json
+docker compose up -d --pull always
+docker compose ps
+curl -fsS http://127.0.0.1:8790/healthz
+curl -fsS http://127.0.0.1:8791/healthz
+```
+
+Docker 自动创建并持久化状态卷，不用在宿主机上创建或修改状态目录的权限。不要使用 `docker compose down -v` 删除状态卷。从旧版绑定宿主机目录的配置切换时，旧 `.bps-local/state-*` 不会被删除，也不会自动导入新卷；如需保留原有 task 身份，请先迁移原来的 `task.key`，否则新卷会生成新的 task 身份。OAuth 凭据不受影响。
+
+`auth-*.json` 和 `.bps-local/` 已被 Git 忽略，不要强制添加或提交。只启动一个账号用 `docker compose up -d bps-a`，此时只需要 A 的凭据文件。如果已有服务占用端口，设置 `BPS_PORT_A` / `BPS_PORT_B` 为不同的可用端口。需要代理时设置 `BPS_PROXY`（共用）或 `BPS_PROXY_A` / `BPS_PROXY_B`（单独覆盖），地址必须能从 Linux 服务器访问。变量可以写在 Compose 的 `.env` 中，但不要在里面存放 OAuth 内容。增加账号时复制一个 `services` 条目，并使用独立服务名、端口、`auth-*.json` 文件和状态卷。替换某账号的凭据文件后，重新设置属主和权限，再用 `docker compose up -d --force-recreate bps-a` 重建对应容器以重新挂载，其他账号不受影响。
+
 ## 使用范围
 
 - 支持 Responses 文本输入、客户端工具调用转换，以及上游事件到本地 SSE 的转换。
-- 每个进程使用一份独立 OAuth 文件；没有多账号管理界面、账号轮询或模型列表接口。
+- 默认进程使用一份独立 OAuth 文件；`--accounts` 可按本地 API Key 固定路由。没有多账号管理界面、账号轮询或模型列表接口。
 - 使用固定 task 槽位池：默认每账号并发 `4`、等待队列 `64`、排队及上游启动等待预算 `30s`。这些是本地配置，不代表上游允许的并发。
 - 可选 `--upstream-rps` 分别限制每账号的 WebSocket 拨号和 `response.create` 启动速率，默认 `0`（关闭限速，仍保留并发限制）。握手安全重试也计入拨号限制。
 - 每次请求自带完整上下文，不跨客户端追加历史；不支持 `previous_response_id`。复用 task 槽位不会复用调用方的对话历史。

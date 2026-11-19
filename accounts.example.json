@@ -1,0 +1,6 @@
+{
+  "accounts": [
+    { "auth": "auth-a.json", "api_key": "REPLACE_WITH_KEY_A" },
+    { "auth": "auth-b.json", "api_key": "REPLACE_WITH_KEY_B" }
+  ]
+}

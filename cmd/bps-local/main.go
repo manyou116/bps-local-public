@@ -38,6 +38,7 @@ func main() {
 		noBrowser     = flag.Bool("no-browser", false, "device login only: print login URL without opening a browser")
 		addr          = flag.String("addr", "127.0.0.1:8790", "loopback address to listen on")
 		authPath      = flag.String("auth", "", "BPS OAuth file (default: $BPS_AUTH_FILE or ~/.bps-local/oauth.json)")
+		accountsPath  = flag.String("accounts", "", "JSON config mapping local API keys to separate BPS OAuth files")
 		showAuthPath  = flag.Bool("auth-path", false, "print selected OAuth file path without reading credentials")
 		proxyURL      = flag.String("proxy", os.Getenv("BPS_LOCAL_PROXY"), "outbound proxy URL, e.g. http://127.0.0.1:7890")
 		transport     = flag.String("upstream-transport", "ws", "official BPS upstream transport: ws only (local API stays HTTP/SSE)")
@@ -61,6 +62,9 @@ func main() {
 	}
 	if *transport != "ws" {
 		log.Fatal("official BPS requires --upstream-transport ws; legacy POST/SSE is unsupported (local API stays HTTP/SSE)")
+	}
+	if *accountsPath != "" && (*authPath != "" || *login || *check || *showAuthPath || *showVersion || diagnostic.Enabled) {
+		log.Fatal("--accounts is a serving mode and cannot be combined with --auth, --login, --check, --auth-path, --version or --protocol-diagnostic")
 	}
 
 	if diagnostic.Enabled {
@@ -88,6 +92,31 @@ func main() {
 			Method: *loginMethod, BrowserPath: *browserPath, NoBrowser: *noBrowser,
 			AuthPath: authPathOrDefault(*authPath), ProxyURL: *proxyURL,
 		}, os.Stdout); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
+	limits := gateway.Limits{PerAccount: *maxConcurrent, Queue: *maxPending, Wait: *queueWait}
+	cfg := proxy.Config{
+		ARCTextSession:    *arcText,
+		Addr:              *addr,
+		Upstream:          basispoints.ResponsesURL,
+		ProxyURL:          *proxyURL,
+		UpstreamTransport: *transport,
+		WSIdleTimeout:     *wsIdle,
+		UpstreamRPS:       *upstreamRPS,
+		RateWaitTimeout:   *rateWait,
+		RateQueueLimit:    *ratePending,
+		ToolsVersion:      *toolsVersion,
+		Verbose:           true,
+	}
+	if *accountsPath != "" {
+		if !proxy.IsLoopback(*addr) {
+			log.Fatalf("refusing to bind %q: this bridge is loopback-only", *addr)
+		}
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		if err := serveAccounts(ctx, *accountsPath, *stateDir, cfg, limits); err != nil {
 			log.Fatal(err)
 		}
 		return
@@ -159,19 +188,7 @@ func main() {
 		log.Fatalf("refusing to bind %q: this bridge is loopback-only", *addr)
 	}
 
-	srv, err := proxy.New(proxy.Config{
-		ARCTextSession:    *arcText,
-		Addr:              *addr,
-		Upstream:          basispoints.ResponsesURL,
-		ProxyURL:          *proxyURL,
-		UpstreamTransport: *transport,
-		WSIdleTimeout:     *wsIdle,
-		UpstreamRPS:       *upstreamRPS,
-		RateWaitTimeout:   *rateWait,
-		RateQueueLimit:    *ratePending,
-		ToolsVersion:      *toolsVersion,
-		Verbose:           true,
-	}, store)
+	srv, err := proxy.New(cfg, store)
 	if err != nil {
 		log.Fatalf("%v", err)
 	}
@@ -180,9 +197,7 @@ func main() {
 
 	log.Printf("using ChatGPT account %s", maskID(accountID))
 	log.Printf("upstream transport: %s; local Responses endpoint: HTTP/SSE", *transport)
-	if err := serveStandalone(ctx, srv, store, *stateDir, gateway.Limits{
-		PerAccount: *maxConcurrent, Queue: *maxPending, Wait: *queueWait,
-	}, *upstreamRPS); err != nil {
+	if err := serveStandalone(ctx, srv, store, *stateDir, limits, *upstreamRPS); err != nil {
 		log.Fatalf("%v", err)
 	}
 }

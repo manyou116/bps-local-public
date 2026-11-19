@@ -36,7 +36,7 @@ echo "packaging bps-local $VERSION"
 
 # Helper scripts and docs ship inside every archive so a user who unzips one
 # file has everything needed to run it.
-STAGE_FILES=(README.md docs/USAGE.md docs/BPS-PROTOCOL-DIAGNOSTIC.md LICENSE oauth.example.json)
+STAGE_FILES=(README.md docs/USAGE.md docs/BPS-PROTOCOL-DIAGNOSTIC.md LICENSE oauth.example.json accounts.example.json)
 STAGE_WIN=(bps.ps1 bps-codex.ps1)
 
 build_one() {

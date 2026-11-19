@@ -244,6 +244,7 @@ func TestIsLoopback(t *testing.T) {
 		{"[::1]:8790", true},
 		{"::1", true},
 		{"", true},
+		{":8790", false},
 		{"0.0.0.0:8790", false},
 		{"0.0.0.0", false},
 		{"192.168.1.5:8790", false},

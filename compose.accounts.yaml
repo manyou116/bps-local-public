@@ -1,0 +1,34 @@
+name: bps-keyed
+
+services:
+  bps-local:
+    image: ${BPS_IMAGE:-bps-local:accounts}
+    build: .
+    network_mode: host
+    restart: unless-stopped
+    command: ["--addr", "127.0.0.1:${BPS_PORT:-8790}", "--accounts", "/run/bps/accounts.json", "--state-dir", "/home/nonroot/accounts-state"]
+    environment:
+      BPS_LOCAL_PROXY: "${BPS_PROXY:-}"
+    volumes:
+      - type: bind
+        source: ./accounts.json
+        target: /run/bps/accounts.json
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./auth-a.json
+        target: /run/bps/auth-a.json
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./auth-b.json
+        target: /run/bps/auth-b.json
+        read_only: true
+        bind:
+          create_host_path: false
+      - accounts-state:/home/nonroot
+
+volumes:
+  accounts-state:

@@ -113,7 +113,9 @@ BPS_LOCAL_PROXY=http://127.0.0.1:7890 ./bps-local
   --proxy http://127.0.0.1:7890
 ```
 
-服务只允许绑定回环地址，不接受 `0.0.0.0`。本地端点没有 API Key 校验，应在可信的本机环境使用。按 `Ctrl+C` 停止服务。多个实例必须使用不同的监听地址和独立状态目录，详见第 5 节。
+服务只允许绑定回环地址，不接受 `0.0.0.0`。默认单账号模式没有 API Key 校验，应在可信的本机环境使用。按 `Ctrl+C` 停止服务。多个实例必须使用不同的监听地址和独立状态目录，详见第 5 节。
+
+如需让多个账号共用一个端口，参照 [配置模板](../accounts.example.json) 准备 `accounts.json`，每项只写 `auth` 和 `api_key`，再运行 `./bps-local --accounts ./accounts.json`。请求通过 `Authorization: Bearer <api_key>` 固定选择一份 OAuth 文件；不能使用 OAuth Token 代替本地 API Key。密钥缺失或错误时返回 `401`，账号故障时不会切换到另一个账号。相对 OAuth 路径按配置文件目录解析；状态默认在 `~/.bps-local/accounts-state` 下按配置顺序使用 `account-1`、`account-2` 等目录。`--accounts` 只用于启动服务，授权和凭据检查仍使用 `--auth`。
 
 Windows 附带脚本 `bps.ps1` 的默认代理为 `http://127.0.0.1:12450`。如果代理实际监听 `7890`，应这样启动：
 
@@ -196,6 +198,7 @@ curl -N http://127.0.0.1:8790/v1/responses \
 | `--browser-path` | 浏览器授权使用的 Chrome、Chromium 或 Edge 可执行文件路径；省略时自动发现 |
 | `--no-browser` | 设备码登录只打印 URL 和设备码，不自动打开浏览器；不支持 browser 模式 |
 | `--auth` | OAuth 文件；未指定时读取 `BPS_AUTH_FILE` 或 `~/.bps-local/oauth.json` |
+| `--accounts` | 按本地 API Key 路由的 JSON 配置；不能和 `--auth`、登录或诊断模式混用 |
 | `--auth-path` | 输出选中的 OAuth 路径后退出，不读取凭据 |
 | `--check` | 检查本地凭据信息，不验证上游生成 |
 | `--addr` | `127.0.0.1:8790`，仅允许回环地址 |
@@ -237,4 +240,4 @@ curl -N http://127.0.0.1:8790/v1/responses \
 | HTTP 200 后出现 `error` 事件 | 流已建立但生成失败，应读取事件体；不能只按 HTTP 状态判断成功 |
 | `request_rejected` | 上游拒绝了请求；该错误本身不能证明具体并发上限、固定请求次数或封控原因 |
 
-`GET /healthz` 仅反映本地服务和凭据读取情况，不会请求上游，不能替代真实生成验证。分享日志或报告前，请确认其中不包含授权文件、Token、代理密码或私人提示词。
+`GET /healthz` 在单账号模式下反映本地服务和凭据读取情况，在 `--accounts` 模式下仅检查进程存活，不返回任何账号信息。两种模式都不会请求上游，不能替代真实生成验证。分享日志或报告前，请确认其中不包含授权文件、Token、代理密码或私人提示词。

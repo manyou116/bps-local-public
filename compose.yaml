@@ -1,0 +1,38 @@
+x-bps-common: &bps-common
+  image: ${BPS_IMAGE:-ghcr.io/sunboyzoey/bps-local-public:latest}
+  network_mode: host
+  restart: unless-stopped
+
+services:
+  bps-a:
+    <<: *bps-common
+    command: ["--addr", "127.0.0.1:${BPS_PORT_A:-8790}", "--auth", "/run/bps-oauth.json", "--state-dir", "/home/nonroot/bps-state"]
+    environment:
+      BPS_LOCAL_PROXY: "${BPS_PROXY_A:-${BPS_PROXY:-}}"
+    volumes:
+      - type: bind
+        source: ./auth-a.json
+        target: /run/bps-oauth.json
+        read_only: true
+        bind:
+          create_host_path: false
+      # Docker initializes the volume from the image's non-root home directory.
+      - bps-state-a:/home/nonroot
+
+  bps-b:
+    <<: *bps-common
+    command: ["--addr", "127.0.0.1:${BPS_PORT_B:-8791}", "--auth", "/run/bps-oauth.json", "--state-dir", "/home/nonroot/bps-state"]
+    environment:
+      BPS_LOCAL_PROXY: "${BPS_PROXY_B:-${BPS_PROXY:-}}"
+    volumes:
+      - type: bind
+        source: ./auth-b.json
+        target: /run/bps-oauth.json
+        read_only: true
+        bind:
+          create_host_path: false
+      - bps-state-b:/home/nonroot
+
+volumes:
+  bps-state-a:
+  bps-state-b:
