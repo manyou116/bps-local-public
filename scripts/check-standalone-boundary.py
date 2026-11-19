@@ -8,9 +8,10 @@ import sys
 
 ROOT = Path(__file__).resolve().parent.parent
 TOP_FILES = {
-    ".gitattributes", ".gitignore", "LICENSE", "README.md", "go.mod", "go.sum",
-    "bps.ps1", "bps-codex.ps1", "oauth.example.json",
+    ".dockerignore", ".gitattributes", ".gitignore", "Dockerfile", "LICENSE",
+    "README.md", "go.mod", "go.sum", "bps.ps1", "bps-codex.ps1", "oauth.example.json",
 }
+WORKFLOWS = {"ci.yml", "docker.yml"}
 PACKAGES = {"auth", "basispoints", "gateway", "proxy", "retryafter", "sanitize"}
 DOCS = {"USAGE.md", "BPS-PROTOCOL-DIAGNOSTIC.md"}
 SCRIPTS = {"package.sh", "check-standalone-boundary.py"}
@@ -26,7 +27,7 @@ def allowed(path):
     if len(parts) == 1:
         return path in TOP_FILES
     if len(parts) == 3 and parts[:2] == (".github", "workflows"):
-        return parts[2] == "ci.yml"
+        return parts[2] in WORKFLOWS
     if len(parts) == 3 and parts[:2] == ("cmd", "bps-local"):
         return parts[2].endswith(".go")
     if len(parts) == 3 and parts[0] == "internal" and parts[1] in PACKAGES:

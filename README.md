@@ -56,6 +56,23 @@ curl -N http://127.0.0.1:8790/v1/responses \
 
 本地接口仅监听回环地址，不要求客户端提供 API Key。它返回流式事件；应检查最终事件和内容，HTTP 连接成功不等于生成成功。
 
+## Docker（Linux）
+
+GitHub Actions 在推送 `main` 或 `v*` 标签时构建并发布 `linux/amd64`、`linux/arm64` 镜像到 `ghcr.io/sunboyzoey/bps-local-public`。`main` 更新 `latest` 和 `sha-<提交 SHA>`，版本标签保留原名。面向 `main` 的 PR 只验证构建，不发布。首次发布后，如需让其他人匿名拉取，请在 GitHub Package 设置中确认可见性为 Public。
+
+在宿主机完成授权，再把凭据文件只读挂载进容器。示例在 Linux 上使用宿主网络，使服务继续只监听 `127.0.0.1:8790`，也能访问宿主机的回环代理。不要加 `-p`；默认桥接网络无法通过端口映射访问容器内只监听回环的服务。
+
+```bash
+mkdir -p "$HOME/.bps-local/docker-state"
+docker run --rm --network host --user "$(id -u):$(id -g)" \
+  --mount "type=bind,src=$HOME/.bps-local/browser-oauth.json,dst=/run/bps-oauth.json,readonly" \
+  --mount "type=bind,src=$HOME/.bps-local/docker-state,dst=/state" \
+  ghcr.io/sunboyzoey/bps-local-public:latest \
+  --auth /run/bps-oauth.json --state-dir /state --proxy http://127.0.0.1:7890
+```
+
+授权保存到了其他文件时，替换第一个挂载的 `src`。没有本地代理时，省略 `--proxy`。镜像内没有浏览器，不支持在容器内进行浏览器授权。
+
 ## 使用范围
 
 - 支持 Responses 文本输入、客户端工具调用转换，以及上游事件到本地 SSE 的转换。
